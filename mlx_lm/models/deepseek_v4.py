@@ -1240,8 +1240,12 @@ class Model(nn.Module):
 
         top_remap = {
             "embed.weight": "model.embed_tokens.weight",
+            "embed.scales": "model.embed_tokens.scales",
+            "embed.biases": "model.embed_tokens.biases",
             "norm.weight": "model.norm.weight",
             "head.weight": "lm_head.weight",
+            "head.scales": "lm_head.scales",
+            "head.biases": "lm_head.biases",
             "hc_head_fn": "model.hc_head.fn",
             "hc_head_base": "model.hc_head.base",
             "hc_head_scale": "model.hc_head.scale",
@@ -1270,7 +1274,7 @@ class Model(nn.Module):
                 ("w2", "down_proj"),
                 ("w3", "up_proj"),
             ):
-                for suffix in ("weight", "scales"):
+                for suffix in ("weight", "scales", "biases"):
                     key0 = f"{prefix}.0.{src}.{suffix}"
                     if key0 in weights:
                         stacked = [
@@ -1280,6 +1284,19 @@ class Model(nn.Module):
                         weights[
                             f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.{suffix}"
                         ] = mx.stack(stacked)
+
+        # Stack grouped wo_a.0..N into single wo_a (concat along output dim)
+        o_groups = self.args.o_groups
+        for layer_idx in range(n_layers):
+            prefix = f"model.layers.{layer_idx}.attn.wo_a"
+            for suffix in ("weight", "scales", "biases"):
+                key0 = f"{prefix}.0.{suffix}"
+                if key0 in weights:
+                    parts = [
+                        weights.pop(f"{prefix}.{g}.{suffix}")
+                        for g in range(o_groups)
+                    ]
+                    weights[f"{prefix}.{suffix}"] = mx.concatenate(parts, axis=0)
 
         return weights
 
