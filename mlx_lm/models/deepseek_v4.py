@@ -846,8 +846,8 @@ class DeepseekV4MoE(nn.Module):
 class DeepseekV4Cache:
     def __init__(self, sliding_window: int):
         self.local = RotatingKVCache(max_size=sliding_window, keep=0)
-        self.compressor_state = {"buffer_kv": None, "buffer_gate": None, "pooled": None}
-        self.indexer_state = {"buffer_kv": None, "buffer_gate": None, "pooled": None}
+        self.compressor_state = {"buffer_x": None, "pooled": None}
+        self.indexer_state = {"buffer_x": None, "pooled": None}
 
     @property
     def offset(self):
@@ -866,12 +866,8 @@ class DeepseekV4Cache:
         local_state = None if self.local.empty() else self.local.state
         return (
             local_state,
-            tuple(
-                self.compressor_state[k] for k in ("buffer_kv", "buffer_gate", "pooled")
-            ),
-            tuple(
-                self.indexer_state[k] for k in ("buffer_kv", "buffer_gate", "pooled")
-            ),
+            tuple(self.compressor_state[k] for k in ("buffer_x", "pooled")),
+            tuple(self.indexer_state[k] for k in ("buffer_x", "pooled")),
         )
 
     @state.setter
@@ -882,12 +878,8 @@ class DeepseekV4Cache:
             self.local.values = None
         else:
             self.local.state = local_state
-        self.compressor_state = dict(
-            zip(("buffer_kv", "buffer_gate", "pooled"), compressor_state)
-        )
-        self.indexer_state = dict(
-            zip(("buffer_kv", "buffer_gate", "pooled"), indexer_state)
-        )
+        self.compressor_state = dict(zip(("buffer_x", "pooled"), compressor_state))
+        self.indexer_state = dict(zip(("buffer_x", "pooled"), indexer_state))
 
     @property
     def meta_state(self):
@@ -931,24 +923,27 @@ class DeepseekV4Cache:
             else self.compressor_state
         )
 
-    def accumulate_windows(
+    def accumulate_x_windows(
         self,
-        kv: mx.array,
-        gate: mx.array,
+        x: mx.array,
         state_key: str,
         ratio: int,
         start_pos: int,
     ):
+        """Buffer raw hidden states; return the ready portion and pool_base.
+
+        By buffering x instead of (kv, gate), the expensive wkv/wgate GEMVs in
+        Compressor are deferred until a full window is ready — saving (ratio-1)/ratio
+        of those GEMVs during single-token decode steps.
+        """
         state = self._branch_state(state_key)
-        buf_kv, buf_gate = state["buffer_kv"], state["buffer_gate"]
-        if buf_kv is not None and buf_kv.shape[1]:
-            kv = mx.concatenate([buf_kv, kv], axis=1)
-            gate = mx.concatenate([buf_gate, gate], axis=1)
-        usable = (kv.shape[1] // ratio) * ratio
-        state["buffer_kv"] = kv[:, usable:]
-        state["buffer_gate"] = gate[:, usable:]
-        pool_base = max(0, start_pos) - (buf_kv.shape[1] if buf_kv is not None else 0)
-        return kv[:, :usable], gate[:, :usable], pool_base
+        buf_x = state["buffer_x"]
+        if buf_x is not None and buf_x.shape[1]:
+            x = mx.concatenate([buf_x, x], axis=1)
+        usable = (x.shape[1] // ratio) * ratio
+        state["buffer_x"] = x[:, usable:]
+        pool_base = max(0, start_pos) - (buf_x.shape[1] if buf_x is not None else 0)
+        return x[:, :usable], pool_base
 
     def update_pool(self, new_pooled: mx.array, state_key: str) -> mx.array:
         state = self._branch_state(state_key)
@@ -1008,16 +1003,25 @@ class Compressor(nn.Module):
         state_key: str = "compressor_state",
     ) -> mx.array:
         B, _, _ = x.shape
-        kv = self.wkv(x)
-        gate = self.wgate(x)
         if cache is None:
+            # Prefill without cache: compute GEMVs for all tokens upfront.
+            kv = self.wkv(x)
+            gate = self.wgate(x)
             usable = (kv.shape[1] // self.compress_ratio) * self.compress_ratio
             ready_kv, ready_gate = kv[:, :usable], gate[:, :usable]
             pool_base = start_pos
         else:
-            ready_kv, ready_gate, pool_base = cache.accumulate_windows(
-                kv, gate, state_key, self.compress_ratio, start_pos
+            # Decode with cache: buffer x and defer wkv/wgate until a full
+            # window is ready, saving (ratio-1)/ratio GEMV calls per step.
+            ready_x, pool_base = cache.accumulate_x_windows(
+                x, state_key, self.compress_ratio, start_pos
             )
+            if ready_x.shape[1] == 0:
+                return cache.update_pool(
+                    mx.zeros((B, 0, self.head_dim), dtype=x.dtype), state_key
+                )
+            ready_kv = self.wkv(ready_x)
+            ready_gate = self.wgate(ready_x)
 
         if ready_kv.shape[1] == 0:
             new_pooled = mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
