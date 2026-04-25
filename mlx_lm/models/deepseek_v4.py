@@ -90,7 +90,7 @@ def _score_func(scores: mx.array, func: str) -> mx.array:
     if func == "sigmoid":
         return mx.sigmoid(scores)
     if func == "sqrtsoftplus":
-        return mx.sqrt(mx.logaddexp(scores, mx.zeros_like(scores)))
+        return mx.sqrt(mx.logaddexp(scores, 0))
     raise ValueError(f"Unsupported DeepSeek-V4 scoring function: {func}")
 
 
@@ -169,27 +169,46 @@ class DeepseekV4RoPE(nn.Module):
         inverse: bool = False,
         positions: Optional[mx.array] = None,
     ):
-        dtype = x.dtype
         L = x.shape[-2]
         pos = (
             mx.arange(offset, offset + L, dtype=mx.float32)
             if positions is None
             else positions.astype(mx.float32)
         )
-        freqs = pos[:, None] * self.inv_freq[None, :]
-        cos = mx.cos(freqs)
-        sin = mx.sin(freqs)
-        if inverse:
-            sin = -sin
+        return _rope_full(x, self.inv_freq, pos, inverse, 0)
 
-        broadcast_shape = (1,) * (x.ndim - 2) + cos.shape
-        cos = cos.reshape(broadcast_shape).astype(dtype)
-        sin = sin.reshape(broadcast_shape).astype(dtype)
 
-        x = x.reshape(*x.shape[:-1], x.shape[-1] // 2, 2)
-        x0, x1 = x[..., 0], x[..., 1]
-        out = mx.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], axis=-1)
-        return out.reshape(*out.shape[:-2], out.shape[-2] * 2)
+@mx.compile
+def _rope_full(
+    x: mx.array,
+    inv_freq: mx.array,
+    pos: mx.array,
+    inverse: bool,
+    nope_dim: int,
+) -> mx.array:
+    freqs = pos[:, None] * inv_freq[None, :]
+    cos = mx.cos(freqs)
+    sin = mx.sin(freqs)
+    if inverse:
+        sin = -sin
+
+    if nope_dim > 0:
+        pe = x[..., nope_dim:]
+    else:
+        pe = x
+
+    broadcast_shape = (1,) * (pe.ndim - 2) + cos.shape
+    cos = cos.reshape(broadcast_shape).astype(pe.dtype)
+    sin = sin.reshape(broadcast_shape).astype(pe.dtype)
+
+    pe = pe.reshape(*pe.shape[:-1], pe.shape[-1] // 2, 2)
+    x0, x1 = pe[..., 0], pe[..., 1]
+    out = mx.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], axis=-1)
+    pe_out = out.reshape(*out.shape[:-2], out.shape[-2] * 2)
+
+    if nope_dim > 0:
+        return mx.concatenate([x[..., :nope_dim], pe_out], axis=-1)
+    return pe_out
 
 
 def _make_partial_rope_kernel():
@@ -245,50 +264,6 @@ def _make_partial_rope_kernel():
 
 _partial_rope_kernel = _make_partial_rope_kernel()
 
-
-def _make_q_norm_kernel():
-    """Per-head RMS norm for query vectors: fuses sq-accumulate + rsqrt + scale in one pass."""
-    if mx.default_device() != mx.gpu or not mx.metal.is_available():
-        return None
-
-    source = """
-        uint tid = thread_position_in_threadgroup.x;  // 0..31 (one SIMD group)
-        uint gid = threadgroup_position_in_grid.x;    // one per (b, l, h) triplet
-
-        int D   = dims[0];
-        int L_v = dims[1];
-        int H_v = dims[2];
-        float eps_v = float(eps[0]);
-
-        uint h   = gid % (uint)H_v;
-        uint tmp = gid / (uint)H_v;
-        uint l   = tmp % (uint)L_v;
-        uint b   = tmp / (uint)L_v;
-
-        const auto xp = x + ((uint64_t)b * L_v * H_v + l * H_v + h) * D;
-        auto       yp = y + ((uint64_t)b * L_v * H_v + l * H_v + h) * D;
-
-        // Pass 1: accumulate partial sum of squares (stride-32 coalesced)
-        float partial_sq = 0.f;
-        for (int i = (int)tid; i < D; i += 32)
-            partial_sq = fma(float(xp[i]), float(xp[i]), partial_sq);
-
-        float rms_scale = metal::fast::rsqrt(simd_sum(partial_sq) / float(D) + eps_v);
-
-        // Pass 2: apply scale (D=512 fits in L1 cache; second pass is cache-warm)
-        for (int i = (int)tid; i < D; i += 32)
-            store_elem(yp[i], float(xp[i]) * rms_scale);
-    """
-    return mx.fast.metal_kernel(
-        name="ds4_q_norm",
-        input_names=["x", "eps", "dims"],
-        output_names=["y"],
-        header="template<typename T> inline void store_elem(device T& dst, float v) { dst = T(v); }",
-        source=source,
-    )
-
-
-_q_norm_kernel = _make_q_norm_kernel()
 
 
 def _make_hc_collapse_kernel():
@@ -432,18 +407,19 @@ def _apply_partial_rope(
                 ("DRH", rope_dim // 2),
                 ("INVERSE", 1 if inverse else 0),
             ],
-            grid=(B * H * L * 32, 1, 1),  # grid = total threads; 32 threads per (b,h,l)
+            grid=(B * H * L * 32, 1, 1),
             threadgroup=(32, 1, 1),
             output_shapes=[x.shape],
             output_dtypes=[x.dtype],
         )[0]
 
-    # Fallback: original slice-rotate-concat path
-    if nope_dim == 0:
-        return rope(x, offset=offset, inverse=inverse, positions=positions)
-    nope, pe = mx.split(x, [nope_dim], axis=-1)
-    pe = rope(pe, offset=offset, inverse=inverse, positions=positions)
-    return mx.concatenate([nope, pe], axis=-1)
+    # Fallback: compiled _rope_full (avoids split/concat of old path)
+    pos = (
+        mx.arange(offset, offset + L, dtype=mx.float32)
+        if positions is None
+        else positions.astype(mx.float32)
+    )
+    return _rope_full(x, rope.inv_freq, pos, inverse, nope_dim)
 
 
 @mx.compile
@@ -791,6 +767,28 @@ def fused_sparse_attention(
     )[0]
 
 
+@mx.compile
+def _hc_collapse_op(pre: mx.array, x: mx.array) -> mx.array:
+    return (pre[..., None] * x.astype(mx.float32)).sum(axis=2).astype(x.dtype)
+
+
+@mx.compile
+def _hc_expand_op(
+    post: mx.array,
+    block_out: mx.array,
+    comb: mx.array,
+    residual: mx.array,
+) -> mx.array:
+    y = post[..., None] * block_out[:, :, None, :].astype(mx.float32)
+    y = y + mx.matmul(comb, residual.astype(mx.float32))
+    return y.astype(block_out.dtype)
+
+
+@mx.compile
+def _rms_rsqrt(flat: mx.array, eps: float) -> mx.array:
+    return mx.rsqrt((flat * flat).mean(axis=-1, keepdims=True) + eps)
+
+
 class HyperConnection(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -808,7 +806,7 @@ class HyperConnection(nn.Module):
         B, L, H, D = x.shape
         flat = x.reshape(B, L, H * D)
         flat_f32 = flat.astype(mx.float32)
-        rsqrt = mx.rsqrt((flat_f32 * flat_f32).mean(axis=-1, keepdims=True) + self.norm_eps)
+        rsqrt = _rms_rsqrt(flat_f32, self.norm_eps)
         # fn is bfloat16; match flat's dtype so MLX uses a native bf16 GEMV.
         mixes = (flat.astype(self.fn.dtype) @ self.fn.T).astype(mx.float32) * rsqrt
         split_sinkhorn = _hc_split_sinkhorn_ops if self.training else hc_split_sinkhorn
@@ -836,7 +834,7 @@ class HyperConnection(nn.Module):
                 output_dtypes=[x.dtype],
             )[0]
         else:
-            collapsed = (pre[..., None] * x.astype(mx.float32)).sum(axis=2).astype(x.dtype)
+            collapsed = _hc_collapse_op(pre, x)
         return collapsed, post, comb
 
     def expand(
@@ -858,9 +856,7 @@ class HyperConnection(nn.Module):
                 output_shapes=[(B, L, self.hc_mult, D)],
                 output_dtypes=[residual.dtype],
             )[0]
-        y = post[..., None] * block_out[:, :, None, :].astype(mx.float32)
-        y = y + mx.matmul(comb.astype(mx.float32), residual.astype(mx.float32))
-        return y.astype(block_out.dtype)
+        return _hc_expand_op(post, block_out, comb, residual)
 
 
 class HyperHead(nn.Module):
@@ -879,7 +875,7 @@ class HyperHead(nn.Module):
         B, L, H, D = x.shape
         flat = x.reshape(B, L, H * D)
         flat_f32 = flat.astype(mx.float32)
-        rsqrt = mx.rsqrt((flat_f32 * flat_f32).mean(axis=-1, keepdims=True) + self.norm_eps)
+        rsqrt = _rms_rsqrt(flat_f32, self.norm_eps)
         mixes = (flat.astype(self.fn.dtype) @ self.fn.T).astype(mx.float32) * rsqrt
         pre = mx.sigmoid(mixes * self.scale[0] + self.base) + self.hc_eps
         if _hc_collapse_kernel is not None:
@@ -1345,6 +1341,7 @@ class V4Attention(nn.Module):
             bias=config.attention_bias,
         )
         self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
+        self._q_l2_norm_weight = (mx.ones((self.head_dim,)),)
 
         rope_theta = (
             config.compress_rope_theta if self.compress_ratio else config.rope_theta
@@ -1420,25 +1417,9 @@ class V4Attention(nn.Module):
         offset = local_cache.offset if local_cache is not None else 0
         q_residual = self.q_norm(self.wq_a(x))
         q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
-        if _q_norm_kernel is not None:
-            q = _q_norm_kernel(
-                inputs=[
-                    q,
-                    mx.array([self.config.rms_norm_eps], dtype=mx.float32),
-                    mx.array([self.head_dim, L, self.n_heads], dtype=mx.int32),
-                ],
-                grid=(B * L * self.n_heads * 32, 1, 1),
-                threadgroup=(32, 1, 1),
-                output_shapes=[q.shape],
-                output_dtypes=[q.dtype],
-            )[0]
-        else:
-            q = (
-                q * mx.rsqrt(
-                    (q.astype(mx.float32) ** 2).mean(axis=-1, keepdims=True)
-                    + self.config.rms_norm_eps
-                )
-            ).astype(x.dtype)
+        q = mx.fast.rms_norm(
+            q, self._q_l2_norm_weight[0].astype(q.dtype), self.config.rms_norm_eps
+        )
         q = q.transpose(0, 2, 1, 3)
         kv = self.kv_norm(self.wkv(x)).reshape(B, L, 1, self.head_dim)
         kv = kv.transpose(0, 2, 1, 3)
