@@ -56,7 +56,6 @@ class ModelArgs(BaseModelArgs):
     num_nextn_predict_layers: int = 1
     tie_word_embeddings: bool = False
     topk_method: str = "noaux_tc"
-    quantization_config: Optional[Dict] = None
 
     def __post_init__(self):
         if not self.compress_ratios:
@@ -75,8 +74,6 @@ class ModelArgs(BaseModelArgs):
         bad = [r for r in self.compress_ratios if r not in (0, 4, 128)]
         if bad:
             raise ValueError(f"Unsupported DeepSeek-V4 compress ratios: {bad}")
-        if self.quantization_config is None:
-            self.quantization_config = _default_quantization()
 
 
 def _score_func(scores: mx.array, func: str) -> mx.array:
