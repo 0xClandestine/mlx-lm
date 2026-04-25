@@ -260,9 +260,9 @@ def _make_partial_rope_kernel():
         const auto cp = cos_s + l * DRH;
         const auto sp = sin_s + l * DRH;
 
-        // Copy the nope prefix (stride-32 coalesced across the SIMD group)
+        // Copy the nope prefix (stride-32 coalesced; direct same-type copy, no float roundtrip)
         for (int i = (int)tid; i < NOPE; i += 32)
-            store_elem(yp[i], float(xp[i]));
+            yp[i] = xp[i];
 
         // Apply RoPE rotation to the trailing D_ROPE = 2*DRH elements.
         // Pairs are interleaved: (x[2i], x[2i+1]) rotated by freq i.
@@ -315,15 +315,30 @@ def _make_q_norm_kernel():
         const auto xp = x + ((uint64_t)b * L_v * H_v + l * H_v + h) * D;
         auto       yp = y + ((uint64_t)b * L_v * H_v + l * H_v + h) * D;
 
-        // Pass 1: accumulate partial sum of squares (stride-32 coalesced)
+        // Pass 1: float4 accumulation — dot(v,v) is a single fused instruction on Apple Silicon
         float partial_sq = 0.f;
-        for (int i = (int)tid; i < D; i += 32)
-            partial_sq = fma(float(xp[i]), float(xp[i]), partial_sq);
+        int D4 = D / 4;
+        for (int i = (int)tid; i < D4; i += 32) {
+            float4 v = float4(float(xp[i*4]), float(xp[i*4+1]),
+                              float(xp[i*4+2]), float(xp[i*4+3]));
+            partial_sq += dot(v, v);
+        }
+        // scalar tail for D % 4 != 0
+        for (int i = D4*4 + (int)tid; i < D; i += 32) {
+            float vi = float(xp[i]);
+            partial_sq = fma(vi, vi, partial_sq);
+        }
 
         float rms_scale = metal::fast::rsqrt(simd_sum(partial_sq) / float(D) + eps_v);
 
-        // Pass 2: apply scale (D=512 fits in L1 cache; second pass is cache-warm)
-        for (int i = (int)tid; i < D; i += 32)
+        // Pass 2: float4 loads, 4x store_elem per iteration
+        for (int i = (int)tid; i < D4; i += 32) {
+            float4 v = float4(float(xp[i*4]), float(xp[i*4+1]),
+                              float(xp[i*4+2]), float(xp[i*4+3])) * rms_scale;
+            store_elem(yp[i*4],   v.x); store_elem(yp[i*4+1], v.y);
+            store_elem(yp[i*4+2], v.z); store_elem(yp[i*4+3], v.w);
+        }
+        for (int i = D4*4 + (int)tid; i < D; i += 32)
             store_elem(yp[i], float(xp[i]) * rms_scale);
     """
     return mx.fast.metal_kernel(
@@ -468,7 +483,8 @@ def _make_hc_split_sinkhorn_kernel():
                 fma(static_cast<float>(mix[BASE + i*HC + 2]), comb_scale, static_cast<float>(base[BASE + i*HC + 2])),
                 fma(static_cast<float>(mix[BASE + i*HC + 3]), comb_scale, static_cast<float>(base[BASE + i*HC + 3]))
             );
-            float m = metal::max(metal::max(v.x, v.y), metal::max(v.z, v.w));
+            float2 _hi = metal::max(v.xy, v.zw);  // two parallel max ops
+            float m = metal::max(_hi.x, _hi.y);
             float4 e = metal::fast::exp(v - m);
             rows[i] = e * 1.0f /(dot(e, float4(1.0f))) + epsv;
         }
@@ -566,10 +582,11 @@ def _make_fused_sparse_attn_kernel():
         uint tid = thread_position_in_threadgroup.x;
         uint gid = threadgroup_position_in_grid.x;
 
-        constexpr int TPH = 4;
-        constexpr int DPT = D / TPH;
-        uint head = tid / TPH;
-        uint lane = tid % TPH;
+        constexpr int TPH  = 4;
+        constexpr int DPT  = D / TPH;
+        constexpr int DPT4 = DPT / 4;  // float4 chunks per lane (D=512 → 32)
+        uint head  = tid / TPH;
+        uint lane  = tid % TPH;
         uint d_off = lane * DPT;
         if (head >= (uint)H) return;
 
@@ -577,96 +594,106 @@ def _make_fused_sparse_attn_kernel():
         uint b = gid / (uint)L_v;
         uint l = gid % (uint)L_v;
 
-        // Load q chunk into registers
-        float qr[DPT];
+        // Load q chunk into float4 registers (128-bit loads, 4x fewer iterations)
+        float4 qr[DPT4];
         {
-            auto p = q + ((uint64_t)b*H*L_v + head*L_v + l) * D;
-            for (int i = 0; i < DPT; i++) qr[i] = float(p[d_off + i]);
+            const auto qp = q + ((uint64_t)b*H*L_v + head*L_v + l) * D + d_off;
+            for (int i = 0; i < DPT4; i++)
+                qr[i] = float4(float(qp[i*4]), float(qp[i*4+1]),
+                               float(qp[i*4+2]), float(qp[i*4+3]));
         }
 
         float m_cur = -1e38f, l_sum = 0.f;
-        float acc[DPT];
-        for (int i = 0; i < DPT; i++) acc[i] = 0.f;
+        float4 acc[DPT4];
+        for (int i = 0; i < DPT4; i++) acc[i] = 0.f;
         float sc = float(scale_val[0]);
 
         // --- Local KV with mask ---
         {
             auto kv_base = local_kv + (uint64_t)b * T_v * D;
-            auto m_base = local_mask + ((uint64_t)b * L_v + l) * T_v;
+            auto m_base  = local_mask + ((uint64_t)b * L_v + l) * T_v;
             for (int t = 0; t < T_v; t++) {
                 float mv = float(m_base[t]);
                 if (mv < -1e9f) continue;
 
-                auto kvp = kv_base + (uint64_t)t * D;
-                float kvr[DPT];
-                float dot = 0.f;
-                for (int i = 0; i < DPT; i++) {
-                    kvr[i] = float(kvp[d_off + i]);
-                    dot = fma(qr[i], kvr[i], dot);
+                const auto kvp = kv_base + (uint64_t)t * D + d_off;
+                float4 kvr[DPT4];
+                float dot_s = 0.f;
+                for (int i = 0; i < DPT4; i++) {
+                    kvr[i] = float4(float(kvp[i*4]), float(kvp[i*4+1]),
+                                    float(kvp[i*4+2]), float(kvp[i*4+3]));
+                    dot_s += metal::dot(qr[i], kvr[i]);
                 }
 
-                float s = dot;
+                float s = dot_s;
                 for (int o = 1; o < TPH; o <<= 1)
                     s += simd_shuffle_xor(s, o);
                 s = fma(s, sc, mv);
 
-                float mn = max(m_cur, s);
+                float mn   = max(m_cur, s);
                 float corr = metal::fast::exp(m_cur - mn);
-                float p = metal::fast::exp(s - mn);
-                l_sum = fma(corr, l_sum, p);
-                for (int i = 0; i < DPT; i++)
-                    acc[i] = fma(corr, acc[i], p * kvr[i]);
+                float pv   = metal::fast::exp(s - mn);
+                l_sum = fma(corr, l_sum, pv);
+                for (int i = 0; i < DPT4; i++)
+                    acc[i] = corr * acc[i] + pv * kvr[i];
                 m_cur = mn;
             }
         }
 
         // --- Sparse (compressed) KV via index gather ---
+        // Branchless: clamp invalid idx to 0, mask score to -inf → zero softmax weight.
+        // Eliminates SIMD divergence from the original `if (idx < 0) continue`.
         {
-            auto ckv = compressed_kv + (uint64_t)b * C_v * D;
-            auto ip = topk_idxs + ((uint64_t)b * L_v + l) * K_v;
+            const auto ckv = compressed_kv + (uint64_t)b * C_v * D;
+            const auto ip  = topk_idxs + ((uint64_t)b * L_v + l) * K_v;
             for (int k = 0; k < K_v; k++) {
-                int idx = int(ip[k]);
-                if (idx < 0) continue;
+                int  idx   = int(ip[k]);
+                bool valid = (idx >= 0);
+                idx = valid ? idx : 0;  // safe load from slot 0 when invalid
 
-                auto kvp = ckv + (uint64_t)idx * D;
-                float kvr[DPT];
-                float dot = 0.f;
-                for (int i = 0; i < DPT; i++) {
-                    kvr[i] = float(kvp[d_off + i]);
-                    dot = fma(qr[i], kvr[i], dot);
+                const auto kvp = ckv + (uint64_t)idx * D + d_off;
+                float4 kvr[DPT4];
+                float dot_s = 0.f;
+                for (int i = 0; i < DPT4; i++) {
+                    kvr[i] = float4(float(kvp[i*4]), float(kvp[i*4+1]),
+                                    float(kvp[i*4+2]), float(kvp[i*4+3]));
+                    dot_s += metal::dot(qr[i], kvr[i]);
                 }
 
-                float s = dot;
+                float s = dot_s;
                 for (int o = 1; o < TPH; o <<= 1)
                     s += simd_shuffle_xor(s, o);
-                s *= sc;
+                s = valid ? (s * sc) : -1e38f;  // mask invalid entry out of softmax
 
-                float mn = max(m_cur, s);
+                float mn   = max(m_cur, s);
                 float corr = metal::fast::exp(m_cur - mn);
-                float p = metal::fast::exp(s - mn);
-                l_sum = fma(corr, l_sum, p);
-                for (int i = 0; i < DPT; i++)
-                    acc[i] = fma(corr, acc[i], p * kvr[i]);
+                float pv   = metal::fast::exp(s - mn);
+                l_sum = fma(corr, l_sum, pv);
+                for (int i = 0; i < DPT4; i++)
+                    acc[i] = corr * acc[i] + pv * kvr[i];
                 m_cur = mn;
             }
         }
 
         // --- Attention sink (score = attn_sink[h], value = 0) ---
         {
-            float ss = float(attn_sink[head]);
-            float mn = max(m_cur, ss);
+            float ss   = float(attn_sink[head]);
+            float mn   = max(m_cur, ss);
             float corr = metal::fast::exp(m_cur - mn);
             l_sum = fma(corr, l_sum, metal::fast::exp(ss - mn));
-            for (int i = 0; i < DPT; i++) acc[i] *= corr;
+            for (int i = 0; i < DPT4; i++) acc[i] *= corr;
             m_cur = mn;
         }
 
         // --- Normalize and write ---
         {
             float inv_l = 1.f / max(l_sum, 1e-6f);
-            auto op = out + ((uint64_t)b*H*L_v + head*L_v + l) * D;
-            for (int i = 0; i < DPT; i++)
-                store_elem(op[d_off + i], acc[i] * inv_l);
+            auto op = out + ((uint64_t)b*H*L_v + head*L_v + l) * D + d_off;
+            for (int i = 0; i < DPT4; i++) {
+                float4 v = acc[i] * inv_l;
+                store_elem(op[i*4],   v.x); store_elem(op[i*4+1], v.y);
+                store_elem(op[i*4+2], v.z); store_elem(op[i*4+3], v.w);
+            }
         }
     """
 
