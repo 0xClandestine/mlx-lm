@@ -113,12 +113,45 @@ def _limited_swiglu(gate: mx.array, up: mx.array, limit: float) -> mx.array:
     return nn.silu(gate) * up
 
 
+def _make_limited_swiglu_kernel(limit: float):
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+    if not limit or limit <= 0:
+        return None
+    return mx.fast.metal_kernel(
+        name="limited_swiglu",
+        input_names=["inp0", "inp1"],
+        output_names=["out0"],
+        source=f"""    uint elem = thread_position_in_grid.x;
+
+    float v1 = inp0[elem];
+    float v2 = inp1[elem];
+
+    constexpr float lim = {float(limit)}f;
+    float v4 = metal::min(v1, lim);
+    float v8 = metal::clamp(v2, -lim, lim);
+    float v9 = 1.0f / (1.0f + metal::exp(-v4));
+    out0[elem] = (float)(v4 * v9 * v8);""",
+    )
+
+
 class LimitedSwiGLU(nn.Module):
     def __init__(self, limit: float):
         super().__init__()
         self.limit = limit
+        self._kernel = _make_limited_swiglu_kernel(limit)
 
     def __call__(self, x, gate):
+        if self._kernel is not None and gate.dtype == mx.float32:
+            out = self._kernel(
+                inputs=[gate, x],
+                output_shapes=[gate.shape],
+                output_dtypes=[mx.float32],
+                grid=(gate.size, 1, 1),
+                threadgroup=(256, 1, 1),
+                template=[],
+            )
+            return out[0]
         return _limited_swiglu(gate, x, self.limit)
 
 
@@ -306,7 +339,8 @@ def _hc_split_sinkhorn_ops(
     comb = mixes[..., 2 * hc_mult :].reshape(
         *mixes.shape[:-1], hc_mult, hc_mult
     ) * comb_scale + base[2 * hc_mult :].reshape(hc_mult, hc_mult)
-    comb = mx.softmax(comb, axis=-1, precise=True) + eps
+    comb = mx.exp(comb - comb.max(axis=-1, keepdims=True))
+    comb = comb / (comb.sum(axis=-1, keepdims=True)) + eps
     comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)
     for _ in range(max(sinkhorn_iters - 1, 0)):
         comb = comb / (comb.sum(axis=-1, keepdims=True) + eps)
@@ -623,7 +657,7 @@ def _hc_expand_op(
     comb: mx.array,
     residual: mx.array,
 ) -> mx.array:
-    y = post[..., None] * block_out[:, :, None, :].astype(mx.float32)
+    y = mx.expand_dims(post, -1) * mx.expand_dims(block_out, -2).astype(mx.float32)
     y = y + mx.matmul(comb.swapaxes(-1, -2), residual.astype(mx.float32))
     return y.astype(block_out.dtype)
 
@@ -635,7 +669,7 @@ def _hc_expand_precomputed(
     comb_residual: mx.array,
 ) -> mx.array:
     """Expand with precomputed comb.T @ residual — no matmul needed."""
-    y = post[..., None] * block_out[:, :, None, :].astype(mx.float32)
+    y = mx.expand_dims(post, -1) * mx.expand_dims(block_out, -2).astype(mx.float32)
     y = y + comb_residual
     return y.astype(block_out.dtype)
 
