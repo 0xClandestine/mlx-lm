@@ -436,16 +436,20 @@ def _hc_collapse_op(pre: mx.array, x: mx.array) -> mx.array:
 
 
 def _make_hc_sinkhorn_collapse_kernel():
-    """Fused sinkhorn + collapse: eliminates one dispatch per HC cycle.
+    """Fused sinkhorn + collapse + comb_residual precomputation.
+
+    Computes sinkhorn, collapse weighted sum, AND comb.T @ residual in a
+    single kernel dispatch. The x tensor is loaded once and used for both
+    collapse and comb_residual — zero extra memory reads. This eliminates
+    the matmul from expand entirely, turning it into a simple element-wise op.
 
     1. BRANCHLESS SINKHORN: all 32 lanes in simd group 0 execute identical
-       instructions. Lanes >= HC use multiplicative mask (active=0) instead
-       of divergent branches — eliminates SIMD serialization.
+       instructions via multiplicative active mask.
     2. PARALLEL SINKHORN: lanes 0-3 each own one comb row. Column norm
        via simd_sum() — free SIMD shuffle.
-    3. NATIVE bfloat4 LOADS: single 64-bit load yields 4 bfloat16 values;
-       cast to float4 is a free hardware conversion.
-    4. FMA CHAINS: collapse uses fused multiply-add for 3 of 4 terms.
+    3. SHARED x LOADS: collapse and comb_residual reuse the same bfloat4
+       vector loads — x is read once, used twice.
+    4. FMA CHAINS: both collapse and comb_residual use fused multiply-add.
     """
     if mx.default_device() != mx.gpu or not mx.metal.is_available():
         return None
@@ -461,15 +465,12 @@ def _make_hc_sinkhorn_collapse_kernel():
 
         const device float* mix      = (const device float*)mixes + row * MIX;
         device float*       post_out = (device float*)post + row * HC;
-        device float*       comb_out = (device float*)comb + row * HC * HC;
 
         threadgroup float pre_shared[HC];
+        threadgroup float comb_shared[HC * HC];
 
         // ================================================================
         // PHASE 1: Branchless sinkhorn on simd group 0
-        //   All 32 lanes execute identical instructions. Lanes >= HC
-        //   compute on clamped indices but multiply by active=0, so they
-        //   contribute zero to simd_sum. No divergent branches in the loop.
         // ================================================================
         if (sg == 0) {
             const float pre_scale  = scale[0];
@@ -480,7 +481,6 @@ def _make_hc_sinkhorn_collapse_kernel():
             const float active = (lane < (uint)HC) ? 1.0f : 0.0f;
             const uint  llane  = metal::min(lane, (uint)(HC - 1));
 
-            // Pre/post sigmoids: all lanes compute, only active lanes write
             float pre_z  = mix[llane]      * pre_scale  + base[llane];
             float post_z = mix[HC + llane] * post_scale + base[HC + llane];
             float pre_v  = 1.0f / (1.0f + metal::fast::exp(-pre_z)) + epsv;
@@ -491,8 +491,6 @@ def _make_hc_sinkhorn_collapse_kernel():
                 post_out[lane]   = post_v;
             }
 
-            // Comb softmax: load + mask. Inactive lanes load row 0 (safe)
-            // but multiply by active=0 so they hold zeros.
             float4 v = (*(const device float4*)(mix  + BASE_OFF + llane * HC)
                             * comb_scale
                       + *(const device float4*)(base + BASE_OFF + llane * HC))
@@ -504,19 +502,14 @@ def _make_hc_sinkhorn_collapse_kernel():
             float4 r = e * (1.0f / (e.x + e.y + e.z + e.w + epsv))
                      + epsv * active;
 
-            // Initial column normalization
             float4 col_inv = 1.0f / (float4(
                 simd_sum(r.x), simd_sum(r.y),
                 simd_sum(r.z), simd_sum(r.w)
             ) + epsv);
             r *= col_inv;
 
-            // Sinkhorn iterations: zero branches in the loop body
             for (int iter = 1; iter < ITERS; ++iter) {
-                // Row norm + re-clamp inactive lanes
                 r *= (1.0f / (r.x + r.y + r.z + r.w + epsv)) * active;
-
-                // Col norm via simd_sum
                 col_inv = 1.0f / (float4(
                     simd_sum(r.x), simd_sum(r.y),
                     simd_sum(r.z), simd_sum(r.w)
@@ -524,55 +517,90 @@ def _make_hc_sinkhorn_collapse_kernel():
                 r *= col_inv;
             }
 
+            // Write comb to threadgroup memory (for phase 2) and post to global
             if (lane < (uint)HC) {
-                *(device float4*)(comb_out + lane * HC) = r;
+                comb_shared[lane * HC + 0] = r.x;
+                comb_shared[lane * HC + 1] = r.y;
+                comb_shared[lane * HC + 2] = r.z;
+                comb_shared[lane * HC + 3] = r.w;
             }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // ================================================================
-        // PHASE 2: Collapse — all 256 threads, native bfloat4 vectorized
+        // PHASE 2: Collapse + comb_residual — shared x loads
+        //   collapsed[d]     = sum_h(pre[h] * x[h,d])
+        //   comb_res[h,d]    = sum_{h'}(comb[h',h] * x[h',d])
+        //   x is loaded ONCE, used for BOTH computations.
         // ================================================================
         const float p0 = pre_shared[0];
         const float p1 = pre_shared[1];
         const float p2 = pre_shared[2];
         const float p3 = pre_shared[3];
 
-        const device bfloat16_t* x_row  = (const device bfloat16_t*)x_in
-                                         + row * (HC * D);
-        device bfloat16_t*       out_row = (device bfloat16_t*)collapsed
-                                         + row * D;
+        // comb transposed columns: comb_res[h,d] = sum_{h'}(comb[h',h] * x[h',d])
+        // Column h of comb = comb_shared[0*HC+h], comb_shared[1*HC+h], ...
+        const float c00 = comb_shared[0],  c01 = comb_shared[1],
+                    c02 = comb_shared[2],  c03 = comb_shared[3];
+        const float c10 = comb_shared[4],  c11 = comb_shared[5],
+                    c12 = comb_shared[6],  c13 = comb_shared[7];
+        const float c20 = comb_shared[8],  c21 = comb_shared[9],
+                    c22 = comb_shared[10], c23 = comb_shared[11];
+        const float c30 = comb_shared[12], c31 = comb_shared[13],
+                    c32 = comb_shared[14], c33 = comb_shared[15];
 
-        // Native bfloat4 pointers: single 64-bit load per vector
+        const device bfloat16_t* x_row = (const device bfloat16_t*)x_in
+                                        + row * (HC * D);
+
         using bf4 = vec<bfloat16_t, 4>;
         const device bf4* x_row0 = (const device bf4*)(x_row + 0*D);
         const device bf4* x_row1 = (const device bf4*)(x_row + 1*D);
         const device bf4* x_row2 = (const device bf4*)(x_row + 2*D);
         const device bf4* x_row3 = (const device bf4*)(x_row + 3*D);
-        device bf4*       out4   = (device bf4*)out_row;
+
+        device bf4* out_col  = (device bf4*)((device bfloat16_t*)collapsed + row * D);
+        device float4* out_cr0  = (device float4*)((device float*)comb_res + row * HC * D + 0*D);
+        device float4* out_cr1  = (device float4*)((device float*)comb_res + row * HC * D + 1*D);
+        device float4* out_cr2  = (device float4*)((device float*)comb_res + row * HC * D + 2*D);
+        device float4* out_cr3  = (device float4*)((device float*)comb_res + row * HC * D + 3*D);
 
         constexpr uint D4 = (uint)D / 4;
 
         for (uint d4 = tid; d4 < D4; d4 += 256) {
+            // Load x once — shared between collapse and comb_residual
             float4 x0 = float4(x_row0[d4]);
             float4 x1 = float4(x_row1[d4]);
             float4 x2 = float4(x_row2[d4]);
             float4 x3 = float4(x_row3[d4]);
 
-            float4 result = fma(float4(p0), x0,
-                            fma(float4(p1), x1,
-                            fma(float4(p2), x2, float4(p3) * x3)));
+            // Collapse: pre-weighted sum
+            out_col[d4] = bf4(fma(float4(p0), x0,
+                               fma(float4(p1), x1,
+                               fma(float4(p2), x2, float4(p3) * x3))));
 
-            out4[d4] = bf4(result);
+            // comb_residual: comb.T @ x (matmul precomputed here, float32)
+            out_cr0[d4] = fma(float4(c00), x0, fma(float4(c10), x1,
+                          fma(float4(c20), x2, float4(c30) * x3)));
+            out_cr1[d4] = fma(float4(c01), x0, fma(float4(c11), x1,
+                          fma(float4(c21), x2, float4(c31) * x3)));
+            out_cr2[d4] = fma(float4(c02), x0, fma(float4(c12), x1,
+                          fma(float4(c22), x2, float4(c32) * x3)));
+            out_cr3[d4] = fma(float4(c03), x0, fma(float4(c13), x1,
+                          fma(float4(c23), x2, float4(c33) * x3)));
         }
 
-        // Scalar tail for D not divisible by 4
         #if (D % 4) != 0
+        device bfloat16_t* out_row = (device bfloat16_t*)collapsed + row * D;
+        device float* cr_row = (device float*)comb_res + row * HC * D;
         for (uint d = D4 * 4 + tid; d < (uint)D; d += 256) {
-            float val = p0*(float)x_row[0*D+d] + p1*(float)x_row[1*D+d]
-                      + p2*(float)x_row[2*D+d] + p3*(float)x_row[3*D+d];
-            out_row[d] = (bfloat16_t)val;
+            float xv0=(float)x_row[0*D+d], xv1=(float)x_row[1*D+d],
+                  xv2=(float)x_row[2*D+d], xv3=(float)x_row[3*D+d];
+            out_row[d] = (bfloat16_t)(p0*xv0 + p1*xv1 + p2*xv2 + p3*xv3);
+            cr_row[0*D+d] = c00*xv0 + c10*xv1 + c20*xv2 + c30*xv3;
+            cr_row[1*D+d] = c01*xv0 + c11*xv1 + c21*xv2 + c31*xv3;
+            cr_row[2*D+d] = c02*xv0 + c12*xv1 + c22*xv2 + c32*xv3;
+            cr_row[3*D+d] = c03*xv0 + c13*xv1 + c23*xv2 + c33*xv3;
         }
         #endif
     """
@@ -580,7 +608,7 @@ def _make_hc_sinkhorn_collapse_kernel():
     return mx.fast.metal_kernel(
         name="deepseek_v4_hc_sinkhorn_collapse",
         input_names=["mixes", "scale", "base", "eps", "x_in"],
-        output_names=["post", "comb", "collapsed"],
+        output_names=["post", "collapsed", "comb_res"],
         source=source,
     )
 
@@ -597,6 +625,18 @@ def _hc_expand_op(
 ) -> mx.array:
     y = post[..., None] * block_out[:, :, None, :].astype(mx.float32)
     y = y + mx.matmul(comb.swapaxes(-1, -2), residual.astype(mx.float32))
+    return y.astype(block_out.dtype)
+
+
+@mx.compile
+def _hc_expand_precomputed(
+    post: mx.array,
+    block_out: mx.array,
+    comb_residual: mx.array,
+) -> mx.array:
+    """Expand with precomputed comb.T @ residual — no matmul needed."""
+    y = post[..., None] * block_out[:, :, None, :].astype(mx.float32)
+    y = y + comb_residual
     return y.astype(block_out.dtype)
 
 
@@ -658,7 +698,7 @@ class HyperConnection(nn.Module):
         return _hc_collapse_op(pre, x), post, comb
 
     def _fused_collapse(self, x: mx.array):
-        """Fused sinkhorn + collapse in a single Metal kernel dispatch."""
+        """Fused sinkhorn + collapse + comb_residual precomputation."""
         B, L, H, D = x.shape
         flat = x.reshape(B, L, H * D).astype(mx.float32)
         if self._fn_T is None:
@@ -669,28 +709,31 @@ class HyperConnection(nn.Module):
         n_rows = B * L
         x_flat = mx.contiguous(x.reshape(n_rows, H, D))
 
-        post, comb, collapsed = _hc_sinkhorn_collapse_kernel(
+        post, collapsed, comb_res = _hc_sinkhorn_collapse_kernel(
             inputs=[mixes, self.scale, self.base, eps, x_flat],
             template=[("HC", self.hc_mult), ("ITERS", self.sinkhorn_iters), ("D", D)],
             grid=(n_rows * 256, 1, 1),
             threadgroup=(256, 1, 1),
             output_shapes=[
                 (*mixes.shape[:-1], self.hc_mult),
-                (*mixes.shape[:-1], self.hc_mult, self.hc_mult),
                 (B, L, D),
+                (n_rows, self.hc_mult, D),
             ],
-            output_dtypes=[mx.float32, mx.float32, x.dtype],
+            output_dtypes=[mx.float32, x.dtype, mx.float32],
         )
-        return collapsed, post, comb
+        return collapsed, post, comb_res
 
     def expand(
         self,
         block_out: mx.array,
         residual: mx.array,
         post: mx.array,
-        comb: mx.array,
+        comb_data: mx.array,
     ):
-        return _hc_expand_op(post, block_out, comb, residual)
+        if comb_data.shape[-1] != self.hc_mult:
+            # Fused path: comb_data is precomputed comb.T @ residual
+            return _hc_expand_precomputed(post, block_out, comb_data)
+        return _hc_expand_op(post, block_out, comb_data, residual)
 
 
 @mx.compile
