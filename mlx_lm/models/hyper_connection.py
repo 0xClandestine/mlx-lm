@@ -107,10 +107,10 @@ class HyperHead(nn.Module):
         B, S, hc, D = x.shape
         dtype = x.dtype
         xf = x.reshape(B, S, hc * D).astype(mx.float32)
-        inv = mx.rsqrt((xf * xf).mean(axis=-1, keepdims=True) + self.norm_eps)
+        xf_norm = mx.fast.rms_norm(xf, weight=None, eps=self.norm_eps)
         if self._fn_t is None:
             self._fn_t = self.fn.T
-        mixes = (xf @ self._fn_t) * inv                     # [B,S,hc]
+        mixes = xf_norm @ self._fn_t                        # [B,S,hc]
         pre = mx.sigmoid(mixes * self.scale[0] + self.base) + self.hc_eps
         y = (pre[..., None] * x.astype(mx.float32)).sum(axis=2)
         return y.astype(dtype)
